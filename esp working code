@@ -1,0 +1,220 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <esp_camera.h>
+#include <Swarm_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include <WebServer.h>
+#include <HardwareSerial.h>
+#include <AsyncUDP.h>
+
+/* =====================================================================
+   ESP32‑CAM → Flask uploader  (VER: debug‑3)
+   Goal: guarantee sendImage() gets invoked and prove the path.
+   Key fixes / additions are tagged:
+   // <------ THIS IS WHAT CHANGED AND NEEDS FIXING
+   ===================================================================== */
+
+// ------------------------------- Debug macros ------------------------------
+#define DEBUG_LOG(msg)        Serial.printf("[%lu] %s\n", millis(), msg)
+#define DEBUG_FMT(fmt, ...)   Serial.printf("[%lu] " fmt "\n", millis(), ##__VA_ARGS__)
+
+// Enable to print JPEG dump & heap each frame
+#define DEBUG_DUMP_JPEG   true  // <------
+#define DEBUG_HEAP        true  // <------
+
+// ------------------------------- Pins (AI‑Thinker) -------------------------
+#define PWDN_GPIO 32
+#define RESET_GPIO -1
+#define XCLK_GPIO 0
+#define SIOD_GPIO 26
+#define SIOC_GPIO 27
+#define Y9_GPIO 35
+#define Y8_GPIO 34
+#define Y7_GPIO 39
+#define Y6_GPIO 36
+#define Y5_GPIO 21
+#define Y4_GPIO 19
+#define Y3_GPIO 18
+#define Y2_GPIO 5
+#define VSYNC_GPIO 25
+#define HREF_GPIO 23
+#define PCLK_GPIO 22
+
+// ------------------------------- Model / image sizes -----------------------
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS   320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS   240
+#define EI_CAMERA_FRAME_BYTE_SIZE         3
+
+// ------------------------------- Wi‑Fi -------------------------------------
+const char* ssid     = "By the eye of Agamotto";
+const char* password = "Barno1234";
+const String serverURL = "http://192.168.237.214:5500";
+
+// ------------------------------- Forward decl. -----------------------------
+static int  ei_camera_get_data(size_t, size_t, float*);
+bool        ei_camera_capture(uint32_t, uint32_t, uint8_t*);
+uint32_t    crc32(const uint8_t*, size_t);
+void        sendImage(const uint8_t*, size_t, const String&);
+void        registerDrone(const String& id);           // <── NEW
+
+// ------------------------------- Globals -----------------------------------
+static uint8_t *snapshot_buf = nullptr;
+static uint8_t *jpeg_buffer  = nullptr;
+static size_t   jpeg_length  = 0;
+
+static SemaphoreHandle_t camMux;
+typedef struct { uint8_t *data; size_t len; } ImageBuf;
+static QueueHandle_t imgQ;
+
+// ------------------------------- Camera config -----------------------------
+static camera_config_t camCfg = {
+  .pin_pwdn = PWDN_GPIO, .pin_reset = RESET_GPIO, .pin_xclk = XCLK_GPIO,
+  .pin_sscb_sda = SIOD_GPIO, .pin_sscb_scl = SIOC_GPIO,
+  .pin_d7 = Y9_GPIO, .pin_d6 = Y8_GPIO, .pin_d5 = Y7_GPIO, .pin_d4 = Y6_GPIO,
+  .pin_d3 = Y5_GPIO, .pin_d2 = Y4_GPIO, .pin_d1 = Y3_GPIO, .pin_d0 = Y2_GPIO,
+  .pin_vsync = VSYNC_GPIO, .pin_href = HREF_GPIO, .pin_pclk = PCLK_GPIO,
+  .xclk_freq_hz = 20000000, .ledc_timer = LEDC_TIMER_0, .ledc_channel = LEDC_CHANNEL_0,
+  .pixel_format = PIXFORMAT_JPEG, .frame_size = FRAMESIZE_QVGA,
+  .jpeg_quality = 12, .fb_count = 1, .fb_location = CAMERA_FB_IN_PSRAM,
+  .grab_mode = CAMERA_GRAB_LATEST
+};
+
+// ------------------------------- Helpers -----------------------------------
+static void dumpJpeg(const uint8_t *d, size_t l){
+  DEBUG_FMT("JPEG %uB CRC32 0x%08X", l, crc32(d,l));
+  for(int i=0;i<((l<64)?l:64);i++){ Serial.printf("%02X ", d[i]); if((i&0x0F)==0x0F) Serial.println(); }
+  Serial.println("...");
+  for(int i=(l>16?l-16:0); i<l; i++){ Serial.printf("%02X ", d[i]); if((i&0x0F)==0x0F) Serial.println(); }
+  Serial.println();
+}
+
+static void printHeap(){
+  DEBUG_FMT("HEAP: %u, PSRAM: %u", ESP.getFreeHeap(), ESP.getFreePsram()); }
+
+// ------------------------------- Setup -------------------------------------
+void setup(){
+  Serial.begin(115200);
+  delay(400);
+  DEBUG_LOG("Booting...");
+
+  if(!psramFound()){ DEBUG_LOG("❌ PSRAM missing"); while(true);}  
+  snapshot_buf = (uint8_t*)ps_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS*EI_CAMERA_RAW_FRAME_BUFFER_ROWS*EI_CAMERA_FRAME_BYTE_SIZE);
+  jpeg_buffer  = (uint8_t*)ps_malloc(200000);
+
+  if(esp_camera_init(&camCfg)!=ESP_OK){ DEBUG_LOG("CAM INIT FAIL"); while(true);}  
+
+  // Wi‑Fi connect
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print('.'); }
+  Serial.println();
+  DEBUG_FMT("IP: %s", WiFi.localIP().toString().c_str());
+
+  // ► FIRST CALL TO /register  ──────────────────────────
+  const String myID = "DRONE-" + WiFi.macAddress();      // keep one copy
+  registerDrone(myID);    
+
+  camMux = xSemaphoreCreateMutex();
+  imgQ   = xQueueCreate(4, sizeof(ImageBuf));
+
+  xTaskCreatePinnedToCore(camTask,   "CAM",  16384, NULL, 1, NULL, 0); // <------ bigger stack
+  xTaskCreatePinnedToCore(sendTask,  "SEND",  8192, NULL, 1, NULL, 1);
+}
+
+void loop(){ vTaskDelay(portMAX_DELAY); }
+
+// ------------------------------- Camera capture task -----------------------
+void camTask(void*){
+  uint32_t frameID=0;
+  for(;;){
+    if(xSemaphoreTake(camMux,portMAX_DELAY)){
+      if(ei_camera_capture(96,96,snapshot_buf)){ // size for EI model
+        frameID++;
+        if(DEBUG_HEAP && frameID%10==0) printHeap();
+
+        // ----- simple FACE/NON‑face heuristic -----------------------------
+        ei::signal_t sig; sig.total_length = 96*96; sig.get_data = &ei_camera_get_data;
+        ei_impulse_result_t res = {0};
+        EI_IMPULSE_ERROR e = run_classifier(&sig,&res,false);
+
+        bool detect = false;
+        if(e==EI_IMPULSE_OK){
+          if(res.bounding_boxes_count){                   // object det model
+            for(uint32_t i=0;i<res.bounding_boxes_count;i++) if(res.bounding_boxes[i].value > 0.6 && strstr(res.bounding_boxes[i].label, "Face")) detect=true;
+          } else {                                        // classifier model
+            for(uint16_t i=0;i<EI_CLASSIFIER_LABEL_COUNT;i++) if(res.bounding_boxes[i].value > 0.6 && strstr(res.bounding_boxes[i].label, "Face")) detect=true;
+          }
+        }
+        DEBUG_FMT("Frame %u detect=%d", frameID, detect); // <------ verbose indicator
+
+        if(detect || frameID%30==0){ // send every 30th frame as heartbeat  <------
+          uint8_t *cpy=(uint8_t*)ps_malloc(jpeg_length); memcpy(cpy,jpeg_buffer,jpeg_length);
+          ImageBuf ib={cpy,jpeg_length};
+          if(xQueueSend(imgQ,&ib,0)!=pdTRUE){ free(cpy); }
+        }
+      }
+      xSemaphoreGive(camMux);
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+// ------------------------------- Sender task -------------------------------
+void sendTask(void *) {
+  const String myID = "DRONE-" + WiFi.macAddress();
+  DEBUG_LOG("SEND task running");
+
+  TickType_t lastReg = xTaskGetTickCount();               // <── NEW
+  const TickType_t regInterval = pdMS_TO_TICKS(10000);    //     10 s
+
+  for (;;) {
+    ImageBuf ib;
+    if (xQueueReceive(imgQ, &ib, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      DEBUG_FMT("Dequeued image %uB", ib.len);
+      sendImage(ib.data, ib.len, myID);
+      free(ib.data);
+    }
+
+    /* ── periodic /register heartbeat ─────────────────── */
+    if (xTaskGetTickCount() - lastReg > regInterval) {    // <── NEW
+      registerDrone(myID);
+      lastReg = xTaskGetTickCount();
+    }
+  }
+}
+
+// ------------------------------- Capt / util -------------------------------
+bool ei_camera_capture(uint32_t w,uint32_t h,uint8_t *out){
+  camera_fb_t *fb=esp_camera_fb_get(); if(!fb) return false; jpeg_length=fb->len; memcpy(jpeg_buffer,fb->buf,jpeg_length);
+  bool ok=fmt2rgb888(fb->buf,fb->len,PIXFORMAT_JPEG,out); esp_camera_fb_return(fb); return ok; }
+
+static int ei_camera_get_data(size_t off,size_t len,float *dst){
+  size_t idx=off*3; for(size_t i=0;i<len;i++){ dst[i]=(snapshot_buf[idx+2]<<16)|(snapshot_buf[idx+1]<<8)|snapshot_buf[idx]; idx+=3;} return 0; }
+
+uint32_t crc32(const uint8_t *d,size_t l){ uint32_t c=0xFFFFFFFF; while(l--){ c^=*d++; for(int k=0;k<8;k++) c=(c>>1)^(0xEDB88320&-(c&1)); } return ~c; }
+
+void sendImage(const uint8_t *img,size_t sz,const String &id){
+  if(DEBUG_DUMP_JPEG) dumpJpeg(img,sz);
+  HTTPClient http; http.begin(serverURL+"/upload_image");
+  http.addHeader("X-Checksum", String(crc32(img,sz)));
+  http.addHeader("Drone-ID", id);
+  http.addHeader("Content-Type","image/jpeg");
+  int code=http.POST((uint8_t*)img, sz);
+  if(code==HTTP_CODE_OK) DEBUG_LOG("✅ Upload OK");
+  else { DEBUG_FMT("❌ Upload failed (%d)", code); DEBUG_LOG(http.getString().c_str()); }
+  http.end();
+}
+
+
+
+
+
+
+void registerDrone(const String& id) {                    // <── NEW
+  HTTPClient http;
+  http.begin(serverURL + "/register");
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST("{\"drone_id\":\"" + id + "\"}");
+  if (code == HTTP_CODE_OK) DEBUG_LOG("✅ Registered with server");
+  else DEBUG_FMT("❌ Register failed (%d)", code);
+  http.end();
+}
