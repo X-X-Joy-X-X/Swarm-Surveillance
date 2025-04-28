@@ -45,12 +45,15 @@
 // Wi-Fi settings
 const char* ssid = "By the eye of Agamotto";
 const char* password = "Barno1234";
-const String serverURL = "http://192.168.114.214:5500";
+const String serverURL = "http://192.168.0.214:5500";
 
 // Global Buffers
 static uint8_t *snapshot_buf = nullptr;
 static uint8_t *jpeg_buffer = nullptr;
 static size_t jpeg_length = 0;
+float currentLat = 0.0;
+float currentLng = 0.0;
+bool locationInitialized = false;
 
 static SemaphoreHandle_t camMux;
 typedef struct { uint8_t *data; size_t len; } ImageBuf;
@@ -226,15 +229,19 @@ void sendImage(const uint8_t *img, size_t sz, const String &id) {
   http.begin(serverURL + "/upload_image");
   http.addHeader("X-Checksum", String(crc32(img, sz)));
   http.addHeader("Drone-ID", id);
+  http.addHeader("X-Latitude", "33.000000");    // <<--- Dummy value
+  http.addHeader("X-Longitude", "-97.000000");  // <<--- Dummy value
   http.addHeader("Content-Type", "image/jpeg");
+  
   int code = http.POST((uint8_t*)img, sz);
   if (code == HTTP_CODE_OK) DEBUG_LOG("✅ Upload OK");
   else {
     DEBUG_FMT("❌ Upload failed (%d)", code);
     DEBUG_LOG(http.getString().c_str());
   }
-  http.end();
+  http.end(); 
 }
+
 
 void registerDrone(const String& id) {
   HTTPClient http;
