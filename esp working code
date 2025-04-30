@@ -48,7 +48,7 @@
 // ------------------------------- Wi‑Fi -------------------------------------
 const char* ssid     = "By the eye of Agamotto";
 const char* password = "Barno1234";
-const String serverURL = "http://192.168.237.214:5500";
+const String serverURL = "http://192.168.0.214:5500";
 
 // ------------------------------- Forward decl. -----------------------------
 static int  ei_camera_get_data(size_t, size_t, float*);
@@ -139,9 +139,9 @@ void camTask(void*){
         bool detect = false;
         if(e==EI_IMPULSE_OK){
           if(res.bounding_boxes_count){                   // object det model
-            for(uint32_t i=0;i<res.bounding_boxes_count;i++) if(res.bounding_boxes[i].value > 0.6 && strstr(res.bounding_boxes[i].label, "Face")) detect=true;
+            for(uint32_t i=0;i<res.bounding_boxes_count;i++) if(res.bounding_boxes[i].value > 0.6 && (strstr(res.bounding_boxes[i].label, "2")||strstr(res.bounding_boxes[i].label, "1")||strstr(res.bounding_boxes[i].label, "0"))) detect=true;
           } else {                                        // classifier model
-            for(uint16_t i=0;i<EI_CLASSIFIER_LABEL_COUNT;i++) if(res.bounding_boxes[i].value > 0.6 && strstr(res.bounding_boxes[i].label, "Face")) detect=true;
+            for(uint16_t i=0;i<EI_CLASSIFIER_LABEL_COUNT;i++) if(res.bounding_boxes[i].value > 0.6 && (strstr(res.bounding_boxes[i].label, "2")||strstr(res.bounding_boxes[i].label, "1")||strstr(res.bounding_boxes[i].label, "0"))) detect=true;
           }
         }
         DEBUG_FMT("Frame %u detect=%d", frameID, detect); // <------ verbose indicator
@@ -198,6 +198,11 @@ void sendImage(const uint8_t *img,size_t sz,const String &id){
   http.addHeader("X-Checksum", String(crc32(img,sz)));
   http.addHeader("Drone-ID", id);
   http.addHeader("Content-Type","image/jpeg");
+
+  http.addHeader("X-Latitude", "33.000000");
+  http.addHeader("X-Longitude", "-97.000000");
+
+
   int code=http.POST((uint8_t*)img, sz);
   if(code==HTTP_CODE_OK) DEBUG_LOG("✅ Upload OK");
   else { DEBUG_FMT("❌ Upload failed (%d)", code); DEBUG_LOG(http.getString().c_str()); }
