@@ -349,7 +349,7 @@ void cameraTask(void *pvParams) {
   
   
   
-  void sendTask(void *pvParams) {
+   void sendTask(void *pvParams) {
     const String myID = "DRONE-" + WiFi.macAddress();
   TickType_t lastReg = xTaskGetTickCount();
   
@@ -377,13 +377,14 @@ void cameraTask(void *pvParams) {
         if(httpCode == HTTP_CODE_OK) {          
           DEBUG_LOG("✅ Upload success, triggering movement");
           xSemaphoreGive(moveSemaphore);
-        }
-      }}DEBUG_LOG("❌ Upload Failed, triggering movement");
-          xSemaphoreGive(moveSemaphore);
+        }else{DEBUG_LOG("❌ Upload Failed, triggering movement");
+          xSemaphoreGive(moveSemaphore);}
+      }}
     
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
+
 
 
 
