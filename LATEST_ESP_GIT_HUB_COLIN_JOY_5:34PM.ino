@@ -296,7 +296,7 @@ void cameraTask(void *pvParams) {
 
           ei_impulse_result_t result = {0};
           EI_IMPULSE_ERROR err = run_classifier(&signal, &result, false);
-          bool detect = true;
+          bool detect = false;
 
           if(err == EI_IMPULSE_OK) {
             for(size_t i = 0; i < result.bounding_boxes_count; i++) {
